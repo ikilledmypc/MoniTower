@@ -22,6 +22,8 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CREDENTIALS_FILE "/credentials.json"
 #define AP_SSID "MoniTower-Setup"
 #define AP_PASSWORD "MoniTower123"
+#define BOOT_COUNT_FILE "/boot_count.json"
+#define MAX_BOOT_COUNT 3
 
 // Animation variables
 unsigned long lastAnimationTime = 0;
@@ -32,7 +34,7 @@ const int DIM_BRIGHTNESS = 30;
 char currentStatus[20] = "no data";  // Track current status for animation updates
 
 // WiFi and provisioning variables
-WiFiClient wifiClient;
+WiFiClientSecure wifiClient;
 HttpClient* httpClient = nullptr;
 WebServer server(80);
 bool inAPMode = false;
@@ -128,6 +130,67 @@ bool deleteCredentials() {
   }
   Serial.println("Failed to delete credentials");
   return false;
+}
+
+// ===== Boot Loop Detection =====
+bool loadBootCount(int& count) {
+  if (!LittleFS.exists(BOOT_COUNT_FILE)) {
+    return false;
+  }
+  
+  File file = LittleFS.open(BOOT_COUNT_FILE, "r");
+  if (!file) return false;
+  
+  StaticJsonDocument<64> doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (error) return false;
+  
+  count = doc["count"] | 0;
+  return true;
+}
+
+bool saveBootCount(int count) {
+  StaticJsonDocument<64> doc;
+  doc["count"] = count;
+  
+  File file = LittleFS.open(BOOT_COUNT_FILE, "w");
+  if (!file) return false;
+  
+  serializeJson(doc, file);
+  file.close();
+  return true;
+}
+
+bool resetBootCount() {
+  return LittleFS.remove(BOOT_COUNT_FILE);
+}
+
+void checkBootLoop() {
+  int count = 0;
+  
+  // Load previous boot count
+  if (loadBootCount(count)) {
+    count++;  // Increment on each boot
+    Serial.print("Consecutive boot count: ");
+    Serial.println(count);
+    
+    if (count >= MAX_BOOT_COUNT) {
+      Serial.println("\n*** BOOT LOOP DETECTED ***");
+      Serial.println("Resetting configuration to factory defaults...");
+      deleteCredentials();
+      resetBootCount();
+      setLEDStatus("ap mode");
+      return;
+    }
+  } else {
+    // First boot
+    count = 1;
+    Serial.println("First boot detected");
+  }
+  
+  saveBootCount(count);
 }
 
 // ===== Access Point Setup =====
@@ -319,8 +382,8 @@ void handleRoot() {
             </div>
             
             <div class="form-group">
-                <label for="password">WiFi Password</label>
-                <input type="password" id="password" name="password" required placeholder="Enter password">
+                <label for="password">WiFi Password <span style="font-size: 12px; color: #999;">(optional)</span></label>
+                <input type="password" id="password" name="password" placeholder="Leave empty for open networks">
             </div>
             
             <button type="submit">Save & Connect</button>
@@ -342,8 +405,9 @@ void handleRoot() {
             const ssid = document.getElementById('ssid').value.trim();
             const password = document.getElementById('password').value;
             
-            if (!ssid || !password) {
-                showError('Please enter both SSID and password');
+            // SSID is required, password is optional
+            if (!ssid) {
+                showError('Please enter WiFi network name (SSID)');
                 return;
             }
             
@@ -407,12 +471,16 @@ void handleConfigure() {
   const char* ssid = doc["ssid"];
   const char* password = doc["password"];
   
-  if (!ssid || !password || strlen(ssid) == 0 || strlen(password) == 0) {
-    server.send(400, "text/plain", "SSID and password required");
+  // SSID is required, but password can be empty for open networks
+  if (!ssid || strlen(ssid) == 0) {
+    server.send(400, "text/plain", "SSID is required");
     return;
   }
   
-  if (saveCredentials(ssid, password)) {
+  // Handle null password for open networks
+  const char* pwd = (password && strlen(password) > 0) ? password : "";
+  
+  if (saveCredentials(ssid, pwd)) {
     server.send(200, "text/plain", "OK");
     // Schedule restart after response is sent
     delay(100);
@@ -456,6 +524,7 @@ bool waitForWiFiConnection() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
     wifiConnectAttempted = false;
+    resetBootCount();  // Clear boot counter on successful connection
     return true;
   }
   
@@ -537,10 +606,10 @@ void checkMonitorStatus() {
     return;
   }
   
-  updateAnimation();
-  
   if (!httpClient) {
     httpClient = new HttpClient(wifiClient, DATADOG_HOST, DATADOG_PORT);
+    httpClient->setHttpResponseTimeout(5000);  // 5 second timeout instead of 30
+    httpClient->setHttpWaitForDataDelay(50);   // Check more frequently
   }
   
   String path = "/api/v1/monitor?api_key=" + String(DATADOG_API_KEY) + 
@@ -548,7 +617,14 @@ void checkMonitorStatus() {
   
   Serial.println("Querying Datadog monitor status...");
   
-  httpClient->get(path);
+  int err = httpClient->get(path);
+  if (err != 0) {
+    Serial.print("Request error: ");
+    Serial.println(err);
+    setLEDStatus("no data");
+    return;
+  }
+  
   int statusCode = httpClient->responseStatusCode();
   String response = httpClient->responseBody();
   
@@ -587,6 +663,58 @@ void checkMonitorStatus() {
   }
 }
 
+// ===== Datadog Monitor Check =====
+void checkMonitorStatusGoogle() {
+  if (!WiFi.isConnected()) {
+    Serial.println("WiFi not connected");
+    setLEDStatus("no data");
+    return;
+  }
+  
+  Serial.print("WiFi status: ");
+  Serial.println(WiFi.status());
+  Serial.print("Local IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Gateway IP: ");
+  Serial.println(WiFi.gatewayIP());
+  
+  if (!httpClient) {
+    httpClient = new HttpClient(wifiClient, "www.google.com", 443);
+  httpClient->setHttpResponseTimeout(5000);
+  httpClient->setHttpWaitForDataDelay(50);
+  }
+
+  
+  
+  Serial.println("Attempting GET request...");
+  
+  int err = httpClient->get("/");
+  Serial.print("get() returned: ");
+  Serial.println(err);
+  
+  if (err != 0) {
+    Serial.print("Connection failed with error: ");
+    Serial.println(err);
+    setLEDStatus("no data");
+    return;
+  }
+  
+  int statusCode = httpClient->responseStatusCode();
+
+  httpClient->stop();  // Close the connection after the request
+  
+  Serial.print("Status Code: ");
+  Serial.println(statusCode);
+  
+  if (statusCode == 200) {
+      Serial.println("Google is reachable, setting status to OK");
+      setLEDStatus("ok");
+    } else {
+      Serial.println("Google is not reachable, setting status to ALERT");
+      setLEDStatus("alert");
+    }
+}
+
 void checkMonitorStatusDummy() {
   setLEDStatus("ok");
 }
@@ -595,7 +723,9 @@ void checkMonitorStatusDummy() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
+
+  wifiClient.setInsecure();  // Disable SSL certificate verification for simplicity (not recommended for production)
+
   Serial.println("\n\nMoniTower Starting...");
   
   // Initialize file system
@@ -604,6 +734,9 @@ void setup() {
   } else {
     Serial.println("File system mounted successfully");
   }
+  
+  // Check for boot loop EARLY
+  checkBootLoop();
   
   // Initialize LED strip
   strip.begin();
@@ -643,17 +776,27 @@ void loop() {
     }
   }
   
-  // Update animation on every loop iteration
-  updateAnimation();
+  // NOTE: Animation is now handled on core 1 in loop1()
   
   // If connected, check monitor status periodically
   if (WiFi.status() == WL_CONNECTED && !inAPMode) {
     static unsigned long lastCheck = 0;
     if (millis() - lastCheck > 30000) {  // Check every 30 seconds
       lastCheck = millis();
-      checkMonitorStatusDummy();  // Use dummy for now
+      checkMonitorStatusGoogle();  // Use dummy for now
     }
   }
   
   delay(100);
+}
+
+// ===== Core 1 - Animation Loop =====
+void setup1() {
+  // Core 1 setup (if needed)
+}
+
+void loop1() {
+  // Core 1 continuously updates animation without blocking
+  updateAnimation();
+  delay(10);  // Small delay to prevent consuming too much CPU
 }
